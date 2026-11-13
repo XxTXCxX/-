@@ -1,6 +1,6 @@
 #!/bin/sh
 # =====================================================================
-#  xray-alpine-oneclick.sh   v1.4
+#  xray-alpine-oneclick.sh   v1.5
 #  Alpine Linux (OpenRC + BusyBox ash) Xray 一键部署脚本
 #
 #  支持创建两种入站（可同时存在，互不影响）：
@@ -520,6 +520,51 @@ EOF
     fi
 }
 
+show_mihomo_yaml() {
+    [ -n "${NODE_HOST:-}" ] || NODE_HOST=$(detect_ip)
+    [ -n "${NODE_HOST:-}" ] || NODE_HOST="<你的服务器IP>"
+    line; info "mihomo / Clash.Meta 配置（proxies 段，粘进配置文件即可）"
+    printf 'proxies:\n'
+    if [ "${TROJAN_ENABLED:-0}" = "1" ]; then
+        cat <<EOF
+  - name: "Trojan-REALITY"
+    type: trojan
+    server: ${NODE_HOST}
+    port: ${T_PORT}
+    password: "${T_PASS}"
+    udp: true
+    sni: ${T_SNI}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: "${T_PUB}"
+      short-id: "${T_SID}"
+    network: tcp
+EOF
+    fi
+    if [ "${VLESS_ENABLED:-0}" = "1" ]; then
+        cat <<EOF
+  - name: "VLESS-XHTTP-REALITY"
+    type: vless
+    server: ${NODE_HOST}
+    port: ${V_PORT}
+    uuid: "${V_UUID}"
+    udp: true
+    tls: true
+    servername: ${V_SNI}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: "${V_PUB}"
+      short-id: "${V_SID}"
+    network: xhttp
+    xhttp-opts:
+      path: "${V_PATH}"
+      mode: auto
+EOF
+    fi
+    line
+    warn "short-id 必须与这里完全一致；public-key 用的是公钥，不要填私钥"
+}
+
 # ---------------------------------------------------------------------
 # 安装流程
 # ---------------------------------------------------------------------
@@ -708,11 +753,12 @@ menu() {
         printf ' 3. 创建 VLESS-XHTTP-REALITY\n'
         printf ' 4. 查看节点链接\n'
         printf ' 5. 查看客户端 JSON 配置\n'
-        printf ' 6. 查看状态 / 重启服务\n'
-        printf ' 7. 查看配置文件\n'
-        printf ' 8. 开启 BBR\n'
-        printf ' 9. 卸载\n'
-        printf '10. 设置节点显示地址 / 域名\n'
+        printf ' 6. 查看 mihomo(Clash) 配置\n'
+        printf ' 7. 查看状态 / 重启服务\n'
+        printf ' 8. 查看配置文件\n'
+        printf ' 9. 开启 BBR\n'
+        printf '10. 卸载\n'
+        printf '11. 设置节点显示地址 / 域名\n'
         printf ' 0. 退出\n'
         printf '%s\n' "================================================"
         _c=$(prompt "请选择" "0")
@@ -722,11 +768,12 @@ menu() {
             3) if [ -x "$XRAY_BIN" ]; then install_vless; else warn "请先安装内核"; fi ;;
             4) load_state; show_links ;;
             5) load_state; show_client_json ;;
-            6) load_state; status_view; if confirm "重启 Xray 服务?"; then restart_xray; fi ;;
-            7) if [ -f "$CONF" ]; then cat "$CONF"; else warn "配置文件不存在"; fi ;;
-            8) enable_bbr ;;
-            9) uninstall_all ;;
-            10) set_host ;;
+            6) load_state; show_mihomo_yaml ;;
+            7) load_state; status_view; if confirm "重启 Xray 服务?"; then restart_xray; fi ;;
+            8) if [ -f "$CONF" ]; then cat "$CONF"; else warn "配置文件不存在"; fi ;;
+            9) enable_bbr ;;
+            10) uninstall_all ;;
+            11) set_host ;;
             0) exit 0 ;;
             *) warn "无效选择" ;;
         esac
