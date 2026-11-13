@@ -1,6 +1,6 @@
 #!/bin/sh
 # =====================================================================
-#  xray-alpine-oneclick.sh   v1.1
+#  xray-alpine-oneclick.sh   v1.4
 #  Alpine Linux (OpenRC + BusyBox ash) Xray 一键部署脚本
 #
 #  支持创建两种入站（可同时存在，互不影响）：
@@ -15,6 +15,15 @@
 #    chmod +x xray-alpine-oneclick.sh
 #    ./xray-alpine-oneclick.sh          # 菜单模式
 #    ./xray-alpine-oneclick.sh auto     # 全自动：装内核 + 两个节点(53999/53666)
+#
+#  兼容性（v1.4）：
+#    - 临时配置文件用 .json 后缀。Xray 25+ 按扩展名判断配置格式，
+#      叫 config.json.tmp 会报 "Failed to get format of ..."
+#    - Xray 26 起字段改名：streamSettings.network -> method、tcp -> raw、
+#      settings.clients -> users。脚本会先按已存写法校验，失败自动换另一种，
+#      并用 xray run -dump 确认用户字段真的被内核解析。
+#    - Trojan 入站不写 flow：xtls-rprx-vision 是 VLESS 专有，
+#      面板里的 "Trojan-TCP-Vision" 只是叫法，REALITY 场景下无需 flow。
 # =====================================================================
 
 XRAY_BIN="/usr/local/bin/xray"
@@ -121,6 +130,7 @@ load_state() {
     TROJAN_ENABLED=0; T_PORT=""; T_PASS=""; T_PRIV=""; T_PUB=""; T_SID=""; T_SNI=""; T_DPORT=443
     VLESS_ENABLED=0;  V_PORT=""; V_UUID=""; V_PRIV=""; V_PUB=""; V_SID=""; V_SNI=""; V_PATH=""; V_DPORT=443
     NODE_HOST=""
+    SCHEMA="new"
     [ -f "$STATE" ] && . "$STATE"
 }
 
@@ -145,9 +155,24 @@ save_state() {
         printf 'V_DPORT="%s"\n' "$V_DPORT"
         printf 'V_PATH="%s"\n' "$V_PATH"
         printf 'NODE_HOST="%s"\n' "$NODE_HOST"
+        printf 'SCHEMA="%s"\n' "$SCHEMA"
     } > "$STATE"
     chmod 600 "$STATE" 2>/dev/null
 }
+
+# ---------------------------------------------------------------------
+# 配置写法兼容（Xray 26.x 起改过字段名）
+#   streamSettings.network -> method，传输名 tcp -> raw
+#   settings.clients      -> users
+# SCHEMA=new 用新写法，SCHEMA=legacy 用旧写法；apply_config 会自动探测切换。
+# ---------------------------------------------------------------------
+SCHEMA="new"
+_net_key() { if [ "$SCHEMA" = "legacy" ]; then printf 'network'; else printf 'method'; fi; }
+_net_val() {
+    if [ "$SCHEMA" = "legacy" ]; then printf '%s' "$1"
+    else case "$1" in tcp) printf 'raw' ;; *) printf '%s' "$1" ;; esac; fi
+}
+_users_key() { if [ "$SCHEMA" = "legacy" ]; then printf 'clients'; else printf 'users'; fi; }
 
 # ---------------------------------------------------------------------
 # 依赖 / 内核 / 服务
@@ -271,12 +296,12 @@ trojan_inbound() {
       "port": ${T_PORT},
       "protocol": "trojan",
       "settings": {
-        "clients": [
+        "$(_users_key)": [
           { "password": "${T_PASS}", "email": "trojan@xray" }
         ]
       },
       "streamSettings": {
-        "network": "tcp",
+        "$(_net_key)": "$(_net_val tcp)",
         "security": "reality",
         "realitySettings": {
           "show": false,
@@ -303,13 +328,13 @@ vless_inbound() {
       "port": ${V_PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [
+        "$(_users_key)": [
           { "id": "${V_UUID}", "email": "vless@xray" }
         ],
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "xhttp",
+        "$(_net_key)": "$(_net_val xhttp)",
         "security": "reality",
         "realitySettings": {
           "show": false,
@@ -357,16 +382,50 @@ build_config() {
     printf '}\n'
 }
 
+# 内核是否真的解析出了用户（字段改名会被静默丢弃，-test 查不出来）
+_probe_user() {   # $1=密码/UUID  $2=配置文件；无法判定时按通过处理
+    [ -n "$1" ] || return 0
+    _d=$("$XRAY_BIN" run -dump -c "$2" 2>/dev/null)
+    [ -n "$_d" ] || return 0
+    printf '%s' "$_d" | grep -F -q -e "$1"
+}
+
 apply_config() {
     mkdir -p "$CONF_DIR" "$LOG_DIR"
-    build_config > "$CONF.tmp"
-    if ! "$XRAY_BIN" run -test -c "$CONF.tmp" >/dev/null 2>&1; then
-        err "配置校验失败："
-        "$XRAY_BIN" run -test -c "$CONF.tmp" 2>&1 | tail -n 10
-        rm -f "$CONF.tmp"
-        return 1
+    # 临时文件必须带 .json 后缀：Xray 25+ 按扩展名判断配置格式，
+    # 叫 config.json.tmp 会报 "Failed to get format of ..."
+    _tmp="${CONF_DIR}/config.test.json"
+    _try=${SCHEMA:-new}
+    if [ "${TROJAN_ENABLED:-0}" = "1" ]; then _probe=$T_PASS; else _probe=$V_UUID; fi
+    SCHEMA=$_try
+    build_config > "$_tmp"
+    if ! _tout=$("$XRAY_BIN" run -test -c "$_tmp" 2>&1); then
+        _e1=$_tout
+        if [ "$_try" = "new" ]; then SCHEMA=legacy; else SCHEMA=new; fi
+        build_config > "$_tmp"
+        if ! _tout=$("$XRAY_BIN" run -test -c "$_tmp" 2>&1); then
+            err "配置校验失败（new / legacy 两种写法都没通过）："
+            printf '%s\n' "$_e1" | tail -n 10 >&2
+            printf '%s\n' "$_tout" | tail -n 10 >&2
+            SCHEMA=$_try
+            rm -f "$_tmp"
+            return 1
+        fi
+        ok "当前内核不认原写法，已自动改用 network/clients"
     fi
-    mv -f "$CONF.tmp" "$CONF"
+    # -test 只保证配置合法；再确认用户字段真的进了内核配置
+    if ! _probe_user "$_probe" "$_tmp"; then
+        _oldschema=$SCHEMA
+        if [ "$SCHEMA" = "new" ]; then SCHEMA=legacy; else SCHEMA=new; fi
+        build_config > "$_tmp"
+        if _probe_user "$_probe" "$_tmp" && "$XRAY_BIN" run -test -c "$_tmp" >/dev/null 2>&1; then
+            ok "已按内核实际字段名调整写法（${SCHEMA}）"
+        else
+            SCHEMA=$_oldschema
+            build_config > "$_tmp"
+        fi
+    fi
+    mv -f "$_tmp" "$CONF"
     chmod 600 "$CONF" 2>/dev/null
     ok "配置已写入 ${CONF}"
     write_init
@@ -412,12 +471,13 @@ show_client_json() {
     ]
   },
   "streamSettings": {
-    "network": "tcp",
+    "$(_net_key)": "$(_net_val tcp)",
     "security": "reality",
     "realitySettings": {
       "serverName": "${T_SNI}",
       "fingerprint": "chrome",
       "publicKey": "${T_PUB}",
+      "password": "${T_PUB}",
       "shortId": "${T_SID}",
       "spiderX": "/"
     }
@@ -440,12 +500,13 @@ EOF
     ]
   },
   "streamSettings": {
-    "network": "xhttp",
+    "$(_net_key)": "$(_net_val xhttp)",
     "security": "reality",
     "realitySettings": {
       "serverName": "${V_SNI}",
       "fingerprint": "chrome",
       "publicKey": "${V_PUB}",
+      "password": "${V_PUB}",
       "shortId": "${V_SID}",
       "spiderX": "/"
     },
@@ -506,9 +567,16 @@ install_trojan() {
     fi
 
     [ -n "${T_SID:-}" ] || T_SID=$(rand_hex 4)
+
+    _prev=${TROJAN_ENABLED:-0}
     TROJAN_ENABLED=1
+    if ! apply_config; then
+        TROJAN_ENABLED=$_prev
+        save_state
+        warn "Trojan 未写入配置，已回滚启用标记"
+        return 1
+    fi
     save_state
-    apply_config || return 1
     show_links
 }
 
@@ -562,9 +630,15 @@ install_vless() {
     if [ -z "${V_PATH:-}" ]; then V_PATH="/$(rand_alnum 10)"; fi
     case "$V_PATH" in /*) : ;; *) V_PATH="/$V_PATH" ;; esac
 
+    _prev=${VLESS_ENABLED:-0}
     VLESS_ENABLED=1
+    if ! apply_config; then
+        VLESS_ENABLED=$_prev
+        save_state
+        warn "VLESS 未写入配置，已回滚启用标记"
+        return 1
+    fi
     save_state
-    apply_config || return 1
     show_links
 }
 
