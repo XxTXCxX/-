@@ -444,6 +444,17 @@ command_background="true"
 pidfile="/run/xray.pid"
 command_user="root:root"
 
+start_pre() {
+    # 上次异常退出可能残留 pid 文件，OpenRC 会误判为已启动而拒绝再启动
+    if [ -n "$pidfile" ] && [ -f "$pidfile" ]; then
+        _stale=$(cat "$pidfile" 2>/dev/null)
+        if [ -z "$_stale" ] || ! kill -0 "$_stale" 2>/dev/null; then
+            rm -f "$pidfile"
+        fi
+    fi
+    return 0
+}
+
 depend() {
     need net
     after firewall
@@ -455,11 +466,25 @@ INITEOF
 }
 
 restart_xray() {
-    if rc-service xray status >/dev/null 2>&1; then
-        rc-service xray restart >/dev/null 2>&1
-    else
-        rc-service xray start >/dev/null 2>&1
+    # OpenRC 在服务异常退出后会留下 pid 文件并拒绝 start，这里先收拾干净。
+    # 现象：rc-service xray start 报 "xray has already been started"，status 却是 crashed。
+    if [ -f /run/xray.pid ]; then
+        _rx_p=$(tr -d '[:space:]' < /run/xray.pid 2>/dev/null)
+        if [ -z "$_rx_p" ] || ! kill -0 "$_rx_p" 2>/dev/null; then
+            rm -f /run/xray.pid
+        fi
     fi
+    # pid 文件没了但进程还活着（多半是被手工 kill 过），按命令行清掉残留进程
+    if [ ! -f /run/xray.pid ]; then
+        for _rx_q in $(ps -o pid,args 2>/dev/null | awk '/[x]ray run -c/ {print $1}'); do
+            kill "$_rx_q" 2>/dev/null
+        done
+        sleep 1
+    fi
+    case "$(rc-service xray status 2>&1 | head -n 1)" in
+        *crashed*) rc-service xray zap >/dev/null 2>&1 ;;
+    esac
+    rc-service xray restart >/dev/null 2>&1
     sleep 1
     if rc-service xray status >/dev/null 2>&1; then
         ok "Xray 服务运行中"
@@ -762,7 +787,7 @@ show_links() {
     warn "客户端指纹请用 chrome/firefox/safari/random，不要用 edge/ios。"
 }
 
-client_json() {   # 1=id
+client_json() {   # 1=id（客户端出站，写法固定用 network/tcp，兼容所有客户端）
     _cj_id=$1
     [ -n "$(node_field "$_cj_id" 1)" ] || return 0
     _cj_t=$(node_field "$_cj_id" 2)
@@ -774,7 +799,6 @@ client_json() {   # 1=id
     _cj_sid=$(node_field "$_cj_id" 10)
     _cj_path=$(node_field "$_cj_id" 11)
     _cj_host=$(node_host)
-    _cj_nk=$(_net_key)
     case "$_cj_t" in
     trojan)
         cat <<EOF
@@ -785,7 +809,7 @@ client_json() {   # 1=id
         "servers": [ { "address": "${_cj_host}", "port": ${_cj_port}, "password": "${_cj_cred}" } ]
       },
       "streamSettings": {
-        "${_cj_nk}": "$(_net_val tcp)",
+        "network": "tcp",
         "security": "reality",
         "realitySettings": {
           "serverName": "${_cj_sni}",
@@ -809,7 +833,7 @@ EOF
         ]
       },
       "streamSettings": {
-        "${_cj_nk}": "$(_net_val xhttp)",
+        "network": "xhttp",
         "security": "reality",
         "realitySettings": {
           "serverName": "${_cj_sni}",
@@ -834,7 +858,7 @@ EOF
         ]
       },
       "streamSettings": {
-        "${_cj_nk}": "$(_net_val tcp)",
+        "network": "tcp",
         "security": "reality",
         "realitySettings": {
           "serverName": "${_cj_sni}",
@@ -856,28 +880,36 @@ show_client_json() {
         warn "还没有任何节点，菜单 2 可以新建"
         return 0
     fi
-    _sj_n=$(node_count)
     _sj_a=$(prompt "输出哪个节点（编号，A=全部）" "A")
-    if [ "$_sj_a" = "A" ] || [ "$_sj_a" = "a" ]; then
-        printf '{\n  "log": { "loglevel": "warning" },\n  "inbounds": [\n'
-        printf '    { "tag": "socks-in", "listen": "127.0.0.1", "port": 1080, "protocol": "socks",\n'
-        printf '      "settings": { "udp": true } }\n'
-        printf '  ],\n  "outbounds": [\n'
-        _sj_first=1
-        while IFS='|' read -r _sj_id _sj_t _sj_tag _sj_port _sj_cred _sj_sni _sj_dp _sj_pr _sj_pb _sj_sd _sj_path _sj_rm _sj_en; do
-            [ -n "$_sj_id" ] || continue
-            [ "$_sj_en" = "1" ] || continue
-            [ "$_sj_first" = "0" ] && printf ',\n'
-            client_json "$_sj_id"
-            _sj_first=0
-        done < "$NODES"
-        printf '\n    ,{ "tag": "direct", "protocol": "freedom" }\n  ]\n}\n'
-    else
-        [ -n "$(node_field "$_sj_a" 1)" ] || { err "没有编号 %s 的节点" "$_sj_a"; return 1; }
-        printf '{\n  "log": { "loglevel": "warning" },\n  "outbounds": [\n'
-        client_json "$_sj_a"
-        printf '    ,{ "tag": "direct", "protocol": "freedom" }\n  ]\n}\n'
+    _sj_all=0
+    case "$_sj_a" in A|a) _sj_all=1 ;; esac
+    if [ "$_sj_all" = "0" ]; then
+        if [ -z "$(node_field "$_sj_a" 1)" ]; then
+            err "没有编号 %s 的节点" "$_sj_a"
+            return 1
+        fi
     fi
+    printf '{\n  "log": { "loglevel": "warning" },\n'
+    if [ "$_sj_all" = "1" ]; then
+        printf '  "inbounds": [\n'
+        printf '    { "tag": "socks-in", "listen": "127.0.0.1", "port": 1080, "protocol": "socks", "settings": { "udp": true } }\n'
+        printf '  ],\n'
+    fi
+    printf '  "outbounds": [\n'
+    _sj_buf=""
+    while IFS='|' read -r _sj_id _sj_t _sj_tag _sj_port _sj_cred _sj_sni _sj_dp _sj_pr _sj_pb _sj_sd _sj_path _sj_rm _sj_en; do
+        [ -n "$_sj_id" ] || continue
+        if [ "$_sj_all" = "1" ]; then
+            [ "$_sj_en" = "1" ] || continue
+        else
+            [ "$_sj_id" = "$_sj_a" ] || continue
+        fi
+        [ -n "$_sj_buf" ] && printf '%s,\n' "$_sj_buf"
+        _sj_buf=$(client_json "$_sj_id")
+    done < "$NODES"
+    [ -n "$_sj_buf" ] && printf '%s,\n' "$_sj_buf"
+    printf '    { "tag": "direct", "protocol": "freedom" }\n'
+    printf '  ]\n}\n'
 }
 
 show_mihomo_yaml() {
@@ -1324,9 +1356,12 @@ manage_node() {
 set_host() {
     load_state
     NODE_HOST=$(prompt "节点地址或域名（留空自动检测公网 IP）" "${NODE_HOST:-}")
+    if [ -z "$NODE_HOST" ]; then
+        info "正在检测公网 IP..."
+        NODE_HOST=$(detect_ip)
+    fi
     save_state
-    [ -n "$NODE_HOST" ] || NODE_HOST=$(detect_ip)
-    ok "节点地址: ${NODE_HOST:-未检测到}"
+    ok "节点地址: ${NODE_HOST:-未检测到，链接里会显示 SERVER_IP}"
 }
 enable_tuning() {
     modprobe tcp_bbr 2>/dev/null
@@ -1386,12 +1421,15 @@ LOCALEOF
 # 兼容旧调用名
 enable_bbr() { enable_tuning; }
 uninstall_all() {
-    confirm "确认卸载 Xray 内核与 OpenRC 服务（配置保留）?" || return 0
+    confirm "确认卸载 Xray 内核与 OpenRC 服务（节点清单与配置保留）?" || return 0
     rc-service xray stop >/dev/null 2>&1
     rc-update del xray default >/dev/null 2>&1
-    rm -f "$INIT" "$XRAY_BIN"
-    if confirm "同时删除配置与日志目录?"; then
+    rm -f "$INIT" "$XRAY_BIN" /run/xray.pid
+    if confirm "同时删除配置目录（含节点清单与密钥）与日志?"; then
         rm -rf "$CONF_DIR" "$LOG_DIR"
+        ok "配置与日志已删除"
+    else
+        ok "节点清单保留在 $NODES"
     fi
     ok "卸载完成"
 }
