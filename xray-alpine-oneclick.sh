@@ -156,15 +156,18 @@ sanitize() {
 # ---------------------------------------------------------------------
 load_state() {
     NODE_HOST=""
+    NODE_PREFIX="SG"
     SCHEMA="new"
     [ -f "$STATE" ] && . "$STATE" 2>/dev/null
     case "$SCHEMA" in new|legacy) : ;; *) SCHEMA="new" ;; esac
+    [ -n "$NODE_PREFIX" ] || NODE_PREFIX="SG"
 }
 
 save_state() {
     mkdir -p "$CONF_DIR"
     {
         printf 'NODE_HOST="%s"\n' "$NODE_HOST"
+        printf 'NODE_PREFIX="%s"\n' "$NODE_PREFIX"
         printf 'SCHEMA="%s"\n' "$SCHEMA"
     } > "$STATE"
     chmod 600 "$STATE" 2>/dev/null
@@ -724,17 +727,17 @@ node_link() {   # 1=id
     _nl_host=$(node_host)
     case "$_nl_t" in
     trojan)
-        printf 'trojan://%s@%s:%s?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#SG-%s\n' \
-            "$_nl_cred" "$_nl_host" "$_nl_port" "$_nl_sni" "$_nl_pub" "$_nl_sid" "$_nl_tag"
+        printf 'trojan://%s@%s:%s?security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s-%s\n' \
+            "$_nl_cred" "$_nl_host" "$_nl_port" "$_nl_sni" "$_nl_pub" "$_nl_sid" "$NODE_PREFIX" "$_nl_tag"
         ;;
     xhttp)
         _nl_p=$(printf '%s' "$_nl_path" | sed 's#^/##')
-        printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F%s&mode=auto#SG-%s\n' \
-            "$_nl_cred" "$_nl_host" "$_nl_port" "$_nl_sni" "$_nl_pub" "$_nl_sid" "$_nl_p" "$_nl_tag"
+        printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=xhttp&path=%%2F%s&mode=auto#%s-%s\n' \
+            "$_nl_cred" "$_nl_host" "$_nl_port" "$_nl_sni" "$_nl_pub" "$_nl_sid" "$_nl_p" "$NODE_PREFIX" "$_nl_tag"
         ;;
     vision)
-        printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#SG-%s\n' \
-            "$_nl_cred" "$_nl_host" "$_nl_port" "$_nl_sni" "$_nl_pub" "$_nl_sid" "$_nl_tag"
+        printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s-%s\n' \
+            "$_nl_cred" "$_nl_host" "$_nl_port" "$_nl_sni" "$_nl_pub" "$_nl_sid" "$NODE_PREFIX" "$_nl_tag"
         ;;
     esac
 }
@@ -803,7 +806,7 @@ client_json() {   # 1=id（客户端出站，写法固定用 network/tcp，兼�
     trojan)
         cat <<EOF
     {
-      "tag": "SG-${_cj_tag}",
+      "tag": "${NODE_PREFIX}-${_cj_tag}",
       "protocol": "trojan",
       "settings": {
         "servers": [ { "address": "${_cj_host}", "port": ${_cj_port}, "password": "${_cj_cred}" } ]
@@ -824,7 +827,7 @@ EOF
     xhttp)
         cat <<EOF
     {
-      "tag": "SG-${_cj_tag}",
+      "tag": "${NODE_PREFIX}-${_cj_tag}",
       "protocol": "vless",
       "settings": {
         "vnext": [
@@ -849,7 +852,7 @@ EOF
     vision)
         cat <<EOF
     {
-      "tag": "SG-${_cj_tag}",
+      "tag": "${NODE_PREFIX}-${_cj_tag}",
       "protocol": "vless",
       "settings": {
         "vnext": [
@@ -931,7 +934,7 @@ show_mihomo_yaml() {
         case "$_my_t" in
         trojan)
             cat <<EOF
-  - name: "SG-${_my_tag}"
+  - name: "${NODE_PREFIX}-${_my_tag}"
     type: trojan
     server: ${_my_host}
     port: ${_my_port}
@@ -947,7 +950,7 @@ EOF
             ;;
         xhttp)
             cat <<EOF
-  - name: "SG-${_my_tag}"
+  - name: "${NODE_PREFIX}-${_my_tag}"
     type: vless
     server: ${_my_host}
     port: ${_my_port}
@@ -970,7 +973,7 @@ EOF
             ;;
         vision)
             cat <<EOF
-  - name: "SG-${_my_tag}"
+  - name: "${NODE_PREFIX}-${_my_tag}"
     type: vless
     server: ${_my_host}
     port: ${_my_port}
@@ -994,7 +997,7 @@ EOF
         [ -n "$_m3_id" ] || continue
         _m3_en=$(printf '%s' "$_m3_rest" | awk -F'|' '{print $NF}')
         [ "$_m3_en" = "1" ] || continue
-        printf '      - "SG-%s"\n' "$_m3_tag"
+        printf '      - "%s-%s"\n' "$NODE_PREFIX" "$_m3_tag"
     done < "$NODES"
     printf '      - DIRECT\n'
     warn "把上面内容并入你的 config.yaml 后 mihomo -t 校验再加载。"
@@ -1040,7 +1043,7 @@ ask_port() {   # 1=默认值 2=忽略占用检查的节点id（可选）
             warn "端口非法：$_ap"
             continue
         fi
-        if [ "${node_port_used "$_ap"}" = "1" ]; then
+        if [ "$(node_port_used "$_ap")" = "1" ]; then
             if [ -n "$_ap_own" ] && [ "$(node_field "$_ap_own" 4)" = "$_ap" ]; then
                 ASK_PORT=$_ap
                 return 0
@@ -1360,8 +1363,11 @@ set_host() {
         info "正在检测公网 IP..."
         NODE_HOST=$(detect_ip)
     fi
+    NODE_PREFIX=$(prompt "节点名前缀（用于链接与 mihomo 名称，如 HK / SG / JP）" "${NODE_PREFIX:-SG}")
+    NODE_PREFIX=$(sanitize "$NODE_PREFIX" | tr -cd 'A-Za-z0-9_-')
+    [ -n "$NODE_PREFIX" ] || NODE_PREFIX="SG"
     save_state
-    ok "节点地址: ${NODE_HOST:-未检测到，链接里会显示 SERVER_IP}"
+    ok "节点地址: ${NODE_HOST:-未检测到，链接里会显示 SERVER_IP}   名前缀: ${NODE_PREFIX}"
 }
 enable_tuning() {
     modprobe tcp_bbr 2>/dev/null
